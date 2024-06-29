@@ -18,6 +18,11 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/Xft/Xft.h>
+#include <fribidi.h>
+
+#include <cairo/cairo.h>
+#include <cairo/cairo-xlib.h>
+#include <cairo/cairo-pdf.h>
 
 #include "arg.h"
 #include "util.h"
@@ -97,6 +102,7 @@ static void cleanup(int slidesonly);
 static void reload(const Arg *arg);
 static void load(FILE *fp);
 static void advance(const Arg *arg);
+static void pdf();
 static void quit(const Arg *arg);
 static void resize(int width, int height);
 static void run(void);
@@ -117,6 +123,7 @@ static void configure(XEvent *);
 
 /* Globals */
 static const char *fname = NULL;
+static char fribidi_text[BUFSIZ] = "";
 static Slide *slides = NULL;
 static int idx = 0;
 static int slidecount = 0;
@@ -133,6 +140,26 @@ static void (*handler[LASTEvent])(XEvent *) = {
 	[Expose] = expose,
 	[KeyPress] = kpress,
 };
+
+static void
+apply_fribidi(char *str)
+{
+        FriBidiStrIndex len = strlen(str);
+        FriBidiChar logical[BUFSIZ];
+        FriBidiChar visual[BUFSIZ];
+        FriBidiParType base = FRIBIDI_PAR_ON;
+        FriBidiCharSet charset;
+        fribidi_boolean result;
+
+        fribidi_text[0] = 0;
+        if (len>0)
+        {
+                charset = fribidi_parse_charset("UTF-8");
+                len = fribidi_charset_to_unicode(charset, str, len, logical);
+                result = fribidi_log2vis(logical, len, &base, visual, NULL, NULL, NULL);
+                len = fribidi_unicode_to_charset(charset, visual, len, fribidi_text);
+        }
+}
 
 int
 filter(int fd, const char *cmd)
@@ -430,10 +457,6 @@ load(FILE *fp)
 		maxlines = 0;
 		memset((s = &slides[slidecount]), 0, sizeof(Slide));
 		do {
-			/* if there's a leading null, we can't do blen-1 */
-			if (buf[0] == '\0')
-				continue;
-
 			if (buf[0] == '#')
 				continue;
 
@@ -479,6 +502,42 @@ advance(const Arg *arg)
 		idx = new_idx;
 		xdraw();
 	}
+}
+
+void
+pdf()
+{
+	const Arg next = { .i = 1 };
+	Arg first;
+	cairo_surface_t *cs;
+
+	if (!fname)
+		fname = "slides";
+
+	char filename[strlen(fname) + 5];
+	sprintf(filename, "%s.pdf", fname);
+	cairo_surface_t *pdf = cairo_pdf_surface_create(filename, xw.w, xw.h);
+
+	cairo_t *cr = cairo_create(pdf);
+
+	first.i = -idx;
+	advance(&first);
+
+	cs = cairo_xlib_surface_create(xw.dpy, xw.win, xw.vis, xw.w, xw.h);
+	cairo_set_source_surface(cr, cs, 0.0, 0.0);
+	for (int i = 0; i < slidecount; ++i) {
+		cairo_paint(cr);
+		cairo_show_page(cr);
+		cairo_surface_flush(cs);
+		advance(&next);
+		cairo_surface_mark_dirty(cs);
+	}
+	cairo_surface_destroy(cs);
+
+	cairo_destroy(cr);
+	cairo_surface_destroy(pdf);
+	first.i = -(slidecount-1);
+	advance(&first);
 }
 
 void
@@ -530,15 +589,17 @@ xdraw(void)
 
 	if (!im) {
 		drw_rect(d, 0, 0, xw.w, xw.h, 1, 1);
-		for (i = 0; i < slides[idx].linecount; i++)
+		for (i = 0; i < slides[idx].linecount; i++) {
+			apply_fribidi(slides[idx].lines[i]);
 			drw_text(d,
 			         (xw.w - width) / 2,
 			         (xw.h - height) / 2 + i * linespacing * d->fonts->h,
 			         width,
 			         d->fonts->h,
 			         0,
-			         slides[idx].lines[i],
+			         fribidi_text,
 			         0);
+		}
 		drw_map(d, xw.win, 0, 0, xw.w, xw.h);
 	} else {
 		if (!(im->state & SCALED))
